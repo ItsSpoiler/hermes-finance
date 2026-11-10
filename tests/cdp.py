@@ -589,6 +589,38 @@ def _seconds(etime: str) -> int:
     return s + int(days or 0) * 86400
 
 
+def _reparenting_targets() -> set[int]:
+    """The pids an orphan gets re-parented to on this machine: init (PID 1) and, on a Linux systemd user session, that
+    session's manager (`systemd --user`, a child subreaper: an orphan's PPID is its pid, not 1). reap_orphans and _still
+    read this instead of hard-coding 1, because on a Linux desktop PPID 1 only happens outside a user session - a sweep
+    that accepted only 1 never recognised a leftover Chrome and never reaped it (9 tests, Nov 2026).
+
+    {1}, plus every process named systemd or init running as this user. A pid whose files can't be read is left out. On
+    macOS there is no /proc: {1}, as before.
+    """
+    targets = {1}
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return targets
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    if uid is None:
+        return targets
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if (entry / "comm").read_text().strip() not in ("systemd", "init"):
+                continue
+            for line in (entry / "status").read_text().splitlines():
+                if line.startswith("Uid:"):
+                    if int(line.split()[1]) == uid:
+                        targets.add(int(entry.name))
+                    break
+        except (OSError, ValueError, IndexError):
+            continue
+    return targets
+
+
 def reap_orphans(age: float | None = None, tmp: str | Path | None = None) -> tuple[int, int]:
     """Kill the headless Chromes whose run died without closing them, and delete the hf-cdp-* profiles in $TMPDIR that
     no process uses. One `ps`. A Chrome (all the processes sharing one hf-cdp-* profile) is reaped only when none of
@@ -644,10 +676,11 @@ def reap_orphans(age: float | None = None, tmp: str | Path | None = None) -> tup
                 continue
     killed: list[int] = []
     reaped: dict[str, list[int]] = {}   # profile -> the pids of it signalled (round 4: one at least)
+    targets = _reparenting_targets()    # (init, and on a Linux session its manager: not just PID 1)
     for profile, procs in chromes.items():
         pids = {p[0] for p in procs}
         owners = {p[1] for p in procs} - pids
-        if owners != {1} or max(p[3] for p in procs) < age:
+        if not owners or owners - targets or max(p[3] for p in procs) < age:
             continue
         still = _still(procs, profile)
         if still is None:   # (couldn't look again: left for the next sweep)
@@ -726,6 +759,7 @@ def _still(procs: list[tuple[int, int, int, int, str]], profile: str) -> set[int
         return None
     was = {p[0]: p for p in procs}
     same = set()
+    targets = _reparenting_targets()   # (init, and on a Linux session its manager: not just PID 1)
     for line in out.splitlines():
         f = line.split(None, 8)
         try:
@@ -733,7 +767,7 @@ def _still(procs: list[tuple[int, int, int, int, str]], profile: str) -> set[int
         except (IndexError, ValueError):
             continue
         m = _PROFILE_ARG.search(cmd)
-        if pid in was and pgid == was[pid][2] and start == was[pid][4] and (ppid == 1 or ppid in pids) \
+        if pid in was and pgid == was[pid][2] and start == was[pid][4] and (ppid in targets or ppid in pids) \
                 and m and m.group(1) == profile:
             same.add(pid)
     return same

@@ -60,6 +60,15 @@ from hermes_finance.cdp_client import WebSocket, WebSocketTimeout
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _reparented(ppid_value: str) -> bool:
+    """True when `ps`'s ppid for a stand-in orphan is an init or session manager. macOS: launchd, PID 1. Linux: the
+    systemd user manager instead (a child subreaper), which is why hard-coding "1" failed on every Linux desktop."""
+    try:
+        return int(ppid_value) in cdp._reparenting_targets()
+    except (TypeError, ValueError):
+        return False
+
+
 def _mark() -> str:
     return f"own-{os.getpid()}-{time.time_ns()}"
 
@@ -853,9 +862,10 @@ def test_the_sweep_signals_an_orphans_pid_only_while_it_is_still_that_chrome(tmp
     try:
         orphan = int(real_run([sys.executable, "-c", spawn], capture_output=True, text=True, env=env, timeout=30).stdout)
         deadline = time.monotonic() + 10
-        while ppid(orphan) != "1" and time.monotonic() < deadline:
+        while not _reparented(ppid(orphan)) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert ppid(orphan) == "1", "(the stand-in orphan wasn't re-parented to launchd)"
+        assert int(ppid(orphan)) in cdp._reparenting_targets(), \
+            "(the stand-in orphan wasn't re-parented to an init or session manager)"
         monkeypatch.setattr(subprocess, "run", run)
         cdp.reap_orphans(age=0, tmp=tmp_path)
         monkeypatch.setattr(subprocess, "run", real_run)
@@ -1615,10 +1625,10 @@ def test_the_sweep_signals_only_the_pids_it_verified_never_their_group(tmp_path,
     try:
         orphan = int(real_run([sys.executable, "-c", spawn], capture_output=True, text=True, env=env, timeout=30).stdout)
         deadline = time.monotonic() + 10
-        while (ppid(orphan) != "1" or not member) and time.monotonic() < deadline:
+        while (not _reparented(ppid(orphan)) or not member) and time.monotonic() < deadline:
             member = [p for p in _procs(orphan, mark) if p != orphan]
             time.sleep(0.05)
-        assert ppid(orphan) == "1" and member, "(the stand-in orphan and its group's other process didn't come up)"
+        assert _reparented(ppid(orphan)) and member, "(the stand-in orphan and its group's other process didn't come up)"
         monkeypatch.setattr(subprocess, "run", run)
         monkeypatch.setattr(os, "kill", kill)
         monkeypatch.setattr(os, "killpg", killpg)
@@ -1807,10 +1817,10 @@ def test_the_sweep_deletes_a_reaped_chromes_profile_only_once_nothing_names_it(c
     try:
         orphan = int(real_run([sys.executable, "-c", spawn], capture_output=True, text=True, env=env, timeout=30).stdout)
         deadline = time.monotonic() + 10
-        while (ppid(orphan) != "1" or (helper and not others)) and time.monotonic() < deadline:
+        while (not _reparented(ppid(orphan)) or (helper and not others)) and time.monotonic() < deadline:
             others = [p for p in _procs(orphan, mark) if p != orphan]
             time.sleep(0.05)
-        assert ppid(orphan) == "1" and (not helper or others), "(the stand-in orphan, or its other process, didn't come up)"
+        assert _reparented(ppid(orphan)) and (not helper or others), "(the stand-in orphan, or its other process, didn't come up)"
         denied = {"a denied helper": set(others), "every signal denied": {orphan}}.get(case, set())
         monkeypatch.setattr(subprocess, "run", run)
         monkeypatch.setattr(os, "kill", kill)
